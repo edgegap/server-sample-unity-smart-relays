@@ -99,7 +99,7 @@ namespace LightNet
     /// NOTE: In case of using this library on another platform than Unity, you NEED to re-route 
     /// <see cref="ASSERT"/> and <see cref="CLAMP"/> appropriately!
     /// </summary>
-    public class NetworkService
+    public class NetworkService : INetworkService
     {
         // ASSERT and CLAMP are the only platform specific dependencies. 
         // Route them to somewhere else to make this library completely platform independent!
@@ -380,7 +380,7 @@ namespace LightNet
         public void SetNetworkErrorEmulation(int looseLevel, int maxSendDelay)
         {
             NetworkErrorEmulationLevel = CLAMP(looseLevel, 0, 100);
-            NetworkErrorEmulationDelay = Math.Min(maxSendDelay, 0);
+            NetworkErrorEmulationDelay = Math.Max(maxSendDelay, 0);
         }
 
         /// <summary>
@@ -783,14 +783,25 @@ namespace LightNet
                 {
                     // for servers, we expect the clients to always send a ulong
                     // beforehand, specifying the connection handle we assigned to them
+                    if (data.Length < sizeof(ulong))
+                    {
+                        continue;
+                    }
                     ulong handle = BitConverter.ToUInt64(data, 0);      offset += sizeof(ulong);
-                    connection = Connections[handle];
+                    if (!Connections.TryGetValue(handle, out connection))
+                    {
+                        // late package of a connection that is already gone
+                        continue;
+                    }
                 }
                 else
                 {
                     // for clients, there's always just one connection
                     // and it's handle is always 1
-                    connection = Connections[1];
+                    if (!Connections.TryGetValue(1, out connection))
+                    {
+                        continue;
+                    }
                 }
                 ASSERT(connection != null);
 
@@ -799,14 +810,14 @@ namespace LightNet
                     Connection.ReceiveBuffer buffer = connection.GetUnreliableReceiveBuffer();
 
                     int maxReadSize = CHANNEL_BUFFER_SIZE - buffer.Head;
-                    if (data.Length > maxReadSize)
+                    if (data.Length - offset > maxReadSize)
                     {
                         LogQueue.LogError("Ran out of unreliable receive buffer memory! Message too large?");
                         return;
                     }
 
                     Array.Copy(data, offset, buffer.Buffer, buffer.Head, data.Length - offset);
-                    buffer.Head += data.Length;
+                    buffer.Head += data.Length - offset;
                 }
             }
         }
@@ -1170,12 +1181,15 @@ namespace LightNet
                             }
                             ReliableReceiveBuffer.Head += bytesRead;
 
-                            if (ReliableReceiveBuffer.Head >= sizeof(byte))
+                            // TCP is a stream: one read can hold several messages, or only part of one.
+                            // Consume every complete message, keep the incomplete rest for the next read.
+                            int consumed = 0;
+                            bool bIncomplete = false;
+                            while (!bIncomplete && ReliableReceiveBuffer.Head - consumed >= sizeof(byte))
                             {
-                                int offset = 0;
-                                EMessageType msgType = (EMessageType)ReliableReceiveBuffer.Buffer[0];   offset += sizeof(byte);
-                                bool bResetBuffer = true;
-
+                                int offset = consumed;
+                                int available = ReliableReceiveBuffer.Head - consumed;
+                                EMessageType msgType = (EMessageType)ReliableReceiveBuffer.Buffer[offset];   offset += sizeof(byte);
 
                                 switch (msgType)
                                 {
@@ -1183,6 +1197,7 @@ namespace LightNet
                                     {
                                         //LogQueue.LogInfo("Received ping from'{0}'", new object[] { RemoteReliable.Address.ToString() });
                                         LastPing = DateTime.Now;
+                                        consumed = offset;
                                         break;
                                     }
 
@@ -1196,34 +1211,42 @@ namespace LightNet
 
                                     case EMessageType.ClientInfo:
                                     {
-                                        if (ReliableReceiveBuffer.Head >= sizeof(byte) + sizeof(int) + sizeof(ulong))
+                                        if (available >= sizeof(byte) + sizeof(int) + sizeof(ulong))
                                         {
                                             // This message type should only be received as client!
                                             ASSERT(Owner.Server == null);
 
                                             int localUnreliablePort = BitConverter.ToInt32(ReliableReceiveBuffer.Buffer, offset); offset += sizeof(int);
-                                            RemoteHandle = BitConverter.ToUInt64(ReliableReceiveBuffer.Buffer, offset);
+                                            RemoteHandle = BitConverter.ToUInt64(ReliableReceiveBuffer.Buffer, offset);            offset += sizeof(ulong);
                                             ASSERT(RemoteHandle != 0);
                                             Owner.UnreliableReceive = new UdpClient(localUnreliablePort);
 
                                             LogQueue.LogInfo("Received ClientInfo from'{0}'", new object[] { RemoteReliable.Address.ToString() });
+                                            consumed = offset;
                                         }
                                         else
                                         {
-                                            // do nothing if not the whole message has been received yet
-                                            bResetBuffer = false;
+                                            // wait until the whole message has been received
+                                            bIncomplete = true;
                                         }
                                         break;
                                     }
 
                                     case EMessageType.Message:
                                     {
+                                        if (available < sizeof(byte) + sizeof(ushort))
+                                        {
+                                            bIncomplete = true;
+                                            break;
+                                        }
                                         ushort msgSize = BitConverter.ToUInt16(ReliableReceiveBuffer.Buffer, offset); offset += sizeof(ushort);
-                                        if (ReliableReceiveBuffer.Head >= sizeof(byte) + sizeof(ushort) + msgSize)
+                                        if (available >= sizeof(byte) + sizeof(ushort) + msgSize)
                                         {
                                             // copy message from receive buffer into message queue
                                             byte[] message = new byte[msgSize];
                                             Array.Copy(ReliableReceiveBuffer.Buffer, offset, message, 0, msgSize);
+                                            offset += msgSize;
+                                            consumed = offset;
 
                                             ReceivedReliableMessages.Enqueue(message);
                                             if (ReceivedReliableMessages.Count >= QUEUE_WARN_THRESHOLD)
@@ -1242,8 +1265,8 @@ namespace LightNet
                                         }
                                         else
                                         {
-                                            // do nothing if not the whole message has been received yet
-                                            bResetBuffer = false;
+                                            // wait until the whole message has been received
+                                            bIncomplete = true;
                                         }
                                         break;
                                     }
@@ -1251,24 +1274,23 @@ namespace LightNet
                                     default:
                                     {
                                         LogQueue.LogError("Received message with invalid/unknown message type '{0}'! Ignoring...", new object[] { (byte)msgType });
+                                        // the stream can't be re-synchronized, drop what we have
+                                        consumed = ReliableReceiveBuffer.Head;
                                         break;
                                     }
                                 }
+                            }
 
-                                if (bResetBuffer)
+                            if (consumed > 0)
+                            {
+                                // shift the unconsumed rest to the start of the buffer
+                                // (Array.Copy handles overlapping source and destination)
+                                int remaining = ReliableReceiveBuffer.Head - consumed;
+                                if (remaining > 0)
                                 {
-                                    // from https://docs.microsoft.com/en-us/dotnet/api/system.array.copy?view=net-5.0 :
-                                    // If sourceArray and destinationArray overlap, this method behaves as if the original values of sourceArray 
-                                    // were preserved in a temporary location before destinationArray is overwritten.
-                                    int remaning = CHANNEL_BUFFER_SIZE - ReliableReceiveBuffer.Head;
-                                    if (remaning > 0)
-                                    {
-                                        // shift the buffer to the left
-                                        // TODO: maybe do a ringbuffer instead? Although, we'd also need two memcpy operations in case of edge overlap
-                                        Array.Copy(ReliableReceiveBuffer.Buffer, ReliableReceiveBuffer.Head, ReliableReceiveBuffer.Buffer, 0, remaning);
-                                    }
-                                    ReliableReceiveBuffer.Head = 0;
-                                }                         
+                                    Array.Copy(ReliableReceiveBuffer.Buffer, consumed, ReliableReceiveBuffer.Buffer, 0, remaining);
+                                }
+                                ReliableReceiveBuffer.Head = remaining;
                             }
                         }
 
@@ -1307,40 +1329,45 @@ namespace LightNet
                         // Received UDP data
                         lock (UnreliableReceiveLock)
                         {
-                            ulong timestamp;
-                            ushort msgSize;
-                            if (UnreliableReceiveBuffer.Head >= sizeof(ulong) + sizeof(ushort))
+                            int consumed = 0;
+                            while (UnreliableReceiveBuffer.Head - consumed >= sizeof(ulong) + sizeof(ushort))
                             {
-                                int offset = 0;
-                                timestamp = BitConverter.ToUInt64(UnreliableReceiveBuffer.Buffer, offset);  offset += sizeof(ulong);
-                                msgSize = BitConverter.ToUInt16(UnreliableReceiveBuffer.Buffer, offset);    offset += sizeof(ushort);
+                                int offset = consumed;
+                                ulong timestamp = BitConverter.ToUInt64(UnreliableReceiveBuffer.Buffer, offset);  offset += sizeof(ulong);
+                                ushort msgSize = BitConverter.ToUInt16(UnreliableReceiveBuffer.Buffer, offset);   offset += sizeof(ushort);
 
-                                if (UnreliableReceiveBuffer.Head >= offset + msgSize)
+                                if (UnreliableReceiveBuffer.Head < offset + msgSize)
                                 {
-                                    byte[] message = new byte[msgSize];
-                                    Array.Copy(UnreliableReceiveBuffer.Buffer, offset, message, 0, msgSize);
-                                    ReceivedUnreliableMessages.Enqueue(timestamp, message);
-                                    if (ReceivedUnreliableMessages.GetCount() >= QUEUE_WARN_THRESHOLD)
-                                    {
-                                        LogQueue.LogWarning("The network data queue for unreliable messages has over {0} messages queued! Do you poll them somewhere?");
-                                    }
-
-                                    if ((Owner.EventFlags & ENetworkEventReportFlags.ReceivedMessage) != 0)
-                                    {
-                                        Owner.AddEvent(new ConnectionEvent
-                                        {
-                                            Connection = new ConnectionHandle(Handle),
-                                            EventType = ConnectionEvent.EType.ReceivedMessage
-                                        }, ENetworkEventReportFlags.ReceivedMessage);
-                                    }
-
-                                    int remanining = CHANNEL_BUFFER_SIZE - UnreliableReceiveBuffer.Head;
-                                    if (remanining > 0)
-                                    {
-                                        Array.Copy(UnreliableReceiveBuffer.Buffer, UnreliableReceiveBuffer.Head, UnreliableReceiveBuffer.Buffer, 0, remanining);
-                                    }
-                                    UnreliableReceiveBuffer.Head = 0;
+                                    break;
                                 }
+
+                                byte[] message = new byte[msgSize];
+                                Array.Copy(UnreliableReceiveBuffer.Buffer, offset, message, 0, msgSize);
+                                consumed = offset + msgSize;
+                                ReceivedUnreliableMessages.Enqueue(timestamp, message);
+                                if (ReceivedUnreliableMessages.GetCount() >= QUEUE_WARN_THRESHOLD)
+                                {
+                                    LogQueue.LogWarning("The network data queue for unreliable messages has over {0} messages queued! Do you poll them somewhere?");
+                                }
+
+                                if ((Owner.EventFlags & ENetworkEventReportFlags.ReceivedMessage) != 0)
+                                {
+                                    Owner.AddEvent(new ConnectionEvent
+                                    {
+                                        Connection = new ConnectionHandle(Handle),
+                                        EventType = ConnectionEvent.EType.ReceivedMessage
+                                    }, ENetworkEventReportFlags.ReceivedMessage);
+                                }
+                            }
+
+                            if (consumed > 0)
+                            {
+                                int remaining = UnreliableReceiveBuffer.Head - consumed;
+                                if (remaining > 0)
+                                {
+                                    Array.Copy(UnreliableReceiveBuffer.Buffer, consumed, UnreliableReceiveBuffer.Buffer, 0, remaining);
+                                }
+                                UnreliableReceiveBuffer.Head = remaining;
                             }
                         }
 

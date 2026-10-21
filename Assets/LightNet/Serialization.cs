@@ -39,7 +39,7 @@ namespace LightNet
 
         public static void ToBytes(ulong value, byte[] data, ref int offset)
         {
-            Debug.Assert(offset + sizeof(float) < data.Length);
+            Debug.Assert(offset + sizeof(ulong) <= data.Length);
             byte[] buffer = BitConverter.GetBytes(value);
             Array.Copy(buffer, 0, data, offset, buffer.Length);
             offset += buffer.Length;

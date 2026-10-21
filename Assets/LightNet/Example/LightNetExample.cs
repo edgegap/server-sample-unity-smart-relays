@@ -107,5 +107,6 @@ class CubeTransformData : NetworkData
         int offset = 0;
         Debug.Assert(data[offset++] == ID);
         SerializationHelper.FromBytes(data, ref offset, out Position);
+        SerializationHelper.FromBytes(data, ref offset, out Rotation);
     }
 }

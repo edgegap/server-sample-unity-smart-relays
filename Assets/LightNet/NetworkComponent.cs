@@ -74,8 +74,43 @@ namespace LightNet
         // Why is the size 256? Because the type number used for indexing is a byte
         Type[] NetworkDataTypes = new Type[256];
 
-        NetworkService Net = new NetworkService();
+        INetworkService Net = new NetworkService();
 
+
+        /// <summary>
+        /// Swap the network backend, e.g. for <see cref="LightNet.Edgegap.RelayNetworkService"/>.<br/>
+        /// Only possible while networking is closed. Start the given service afterwards; all events,
+        /// sends and <see cref="NetworkData"/> handling of this component then go through it.
+        /// </summary>
+        /// <returns>False, if networking is still running.</returns>
+        public bool UseNetworkService(INetworkService service)
+        {
+            if (Net.GetState() != ENetworkState.Closed)
+            {
+                Debug.LogWarning("Cannot switch the network service while networking is running!");
+                return false;
+            }
+            Net = service;
+            return true;
+        }
+
+        /// <summary>
+        /// The backend currently in use (direct <see cref="NetworkService"/> by default).
+        /// </summary>
+        public INetworkService GetNetworkService()
+        {
+            return Net;
+        }
+
+        NetworkService UseDirectService()
+        {
+            if (Net is NetworkService direct)
+            {
+                return direct;
+            }
+            direct = new NetworkService();
+            return UseNetworkService(direct) ? direct : null;
+        }
 
         public void RegisterNetworkDataClass<T>(byte ID) where T : NetworkData
         {
@@ -162,8 +197,8 @@ namespace LightNet
         /// <returns>False, if already running or starting the server failed (port already in use?)</returns>
         public bool StartServer(int portReliable, int portUnreliable, int maxClients)
         {
-            //return Net.StartServer(42069, 42169, 1);
-            return Net.StartServer(portReliable, portUnreliable, maxClients);
+            NetworkService direct = UseDirectService();
+            return direct != null && direct.StartServer(portReliable, portUnreliable, maxClients);
         }
 
         /// <summary>
@@ -181,7 +216,8 @@ namespace LightNet
                 Debug.LogError("Invalid IP-Address!");
                 return false;
             }
-            return Net.StartClient(address, portReliable, portUnreliable);
+            NetworkService direct = UseDirectService();
+            return direct != null && direct.StartClient(address, portReliable, portUnreliable);
         }
 
         /// <summary>
@@ -304,7 +340,10 @@ namespace LightNet
 
         void OnApplicationQuit()
         {
-            Net.Close();
+            if (Net.GetState() == ENetworkState.Startup || Net.GetState() == ENetworkState.Running)
+            {
+                Net.Close();
+            }
         }
     }
 }
